@@ -56,7 +56,6 @@ start(Args) :-
     debug(server, "Unknown args ~w", [Args]).
 
 :- dynamic shutdown_request_received/0.
-:- dynamic exit_request_received/0.
 
 % stdio server
 
@@ -106,8 +105,38 @@ handle_requests_stream(StreamPair) :-
 % to write to stdout
 client_handler(In, Out) :-
     catch(handle_requests(In, Out),
-          break_unlimited,
-          debug(server(high), "ending client handler loop", [])).
+          server_event(Event),
+          handle_server_event(Event, In, Out)).
+
+handle_server_event(shutdown_and_exit, _, _) :-
+    debug(server(high), "Shutting down and exiting", []),
+    halt(0).
+handle_server_event(request_after_shutdown(ReqBody), In, Out) :-
+    debug(server(high), "Error: request received after shutdown: ~p", [ReqBody]),
+    send_message(Out, _{id: ReqBody.id,
+                        result: null,
+                        error: _{code: -32600, % JSON RPC InvalidRequest
+                                 message: "Invalid Request"}}),
+    client_handler(In, Out). % Resume
+handle_server_event(exit_before_shutdown, _, _) :-
+    debug(server(high), "Error: exit requested before shutdown", []),
+    halt(1).
+handle_server_event(json_rpc_parse_error, _, Out) :-
+    debug(server(high), "Error: unparsable RPC request", []),
+    send_message(Out, _{id: null,
+                        error: _{code: -32700, % JSON RPC ParseError
+                                 message: "unparsable request"}}),
+    % Since `Content-Length` may not have parsed correctly, we don't know
+    % how much input to skip. Probably safest to shutdown.
+    halt(2).
+handle_server_event(server_error(Err, Ctx, Req), In, Out) :-
+    debug(server(high), "Server error: ~p", [error(Err, Ctx)]),
+    print_message(error, error(Err, Ctx)),
+    ( get_dict(id, Req.body, Id) -> true ; Id = null ),
+    send_message(Out, _{id: Id,
+                        error: _{code: -32001,
+                                 message: "server error"}}),
+    client_handler(In, Out). % Resume
 
 handle_requests(In, Out) :-
     % Parse an unlimited number of requests from the input stream, responding
@@ -120,14 +149,7 @@ request_and_response(Out) -->
     -> % As a side effect, respond to the request
        { ignore(handle_request(Req, Out)) }
     ;  % Failure of `lsp_request//1` indicates an unparsable RPC request
-       { debug(server(high), "unparsable RPC request", []),
-         send_message(Out, _{id: null,
-                             error: _{code: -32700, % JSON RPC ParseError
-                                      message: "unparsable request"}}),
-         % Since `Content-Length` may not have parsed correctly, we don't know
-         % how much input to skip. Probably safest to shutdown (stdio server)
-         % or at least ask socket clients to reconnect.
-         throw(break_unlimited) } ).
+       { throw(server_event(json_rpc_parse_error)) } ).
 
 % general handling stuff
 
@@ -142,22 +164,13 @@ send_message(Stream, Msg) :-
 handle_request(Req, OutStream) :-
     debug(server(high), "Request ~w", [Req.body]),
     catch_with_backtrace(
-        ( ( shutdown_request_received
-          -> ( Req.body.method == "exit"
-             -> handle_msg(Req.body.method, Req.body, _Resp)
-             ; send_message(OutStream, _{id: Req.body.id, error: _{code: -32600, message: "Invalid Request"}}) )
-          ; ( handle_msg(Req.body.method, Req.body, Resp)
-            -> true
-            ; throw(error(domain_error(handleable_message, Req),
-                          context(_Loc, "handle_msg/3 returned false"))) ),
-            ( is_dict(Resp) -> send_message(OutStream, Resp) ; true ) ) ),
-        Err,
-        ( print_message(error, Err),
-          get_dict(id, Req.body, Id),
-          send_message(OutStream, _{id: Id,
-                                    error: _{code: -32001,
-                                             message: "server error"}})
-        )).
+        ( ( handle_msg(Req.body.method, Req.body, Resp)
+              -> true
+              ;  throw(error(domain_error(handleable_message, Req),
+                             context(_Loc, "handle_msg/3 returned false"))) ),
+          ( is_dict(Resp) -> send_message(OutStream, Resp) ; true ) ),
+        error(Err, Ctx), % Only catch exceptions, not `server_event`s...
+        throw(server_event(server_error(Err, Ctx, Req)))). % ...but propagate them as `server_event`s
 
 % Handling messages
 
@@ -199,6 +212,10 @@ server_capabilities(_{textDocumentSync: _{openClose: true,
 :- dynamic loaded_source/1.
 
 % messages (with a response)
+handle_msg(Method, Msg, _) :-
+    shutdown_request_received,
+    dif(Method, "exit"),
+    throw(server_event(request_after_shutdown(Msg))).
 handle_msg("initialize", Msg,
            _{id: Id, result: _{capabilities: ServerCapabilities}}) :-
     _{id: Id, params: Params} :< Msg, !,
@@ -212,13 +229,11 @@ handle_msg("shutdown", Msg, _{id: Id, result: []}) :-
     _{id: Id} :< Msg,
     debug(server, "received shutdown message", []),
     asserta(shutdown_request_received).
-handle_msg("exit", _Msg, false) :-
-    debug(server, "received exit, shutting down", []),
-    asserta(exit_request_received),
+handle_msg("exit", _Msg, _) :-
+    debug(server, "received exit", []),
     ( shutdown_request_received
-    -> debug(server, "Post-shutdown exit, okay", [])
-    ;  debug(server, "No shutdown, unexpected exit", []),
-       halt(1) ).
+    -> throw(server_event(shutdown_and_exit))
+    ;  throw(server_event(exit_before_shutdown)) ).
 handle_msg("textDocument/hover", Msg, _{id: Id, result: Response}) :-
     _{params: _{position: _{character: Char0, line: Line0},
                 textDocument: _{uri: Doc}}, id: Id} :< Msg,
